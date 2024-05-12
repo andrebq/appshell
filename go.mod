@@ -38,5 +38,3 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	honnef.co/go/js/dom v0.0.0-20210725211120-f030747120f2 // indirect
 )
-
-replace github.com/pwiecz/go-fltk => github.com/andrebq/go-fltk v0.0.0-20240511142144-6d9c1ba9698a

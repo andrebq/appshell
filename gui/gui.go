@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"runtime"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -164,6 +166,12 @@ func Run(ctx context.Context, sh Shell) error {
 
 	outputView := widget.NewEntryWithData(win.output)
 	outputView.MultiLine = true
+	scroller := binding.NewDataListener(func() {
+		outputView.CursorRow = math.MaxInt
+		outputView.Refresh()
+	})
+	runtime.SetFinalizer(outputView, func(_ any) { win.output.RemoveListener(scroller) })
+	win.output.AddListener(scroller)
 
 	nextCmdView := newCodeEntryWithData(win.nextCmd)
 	nextCmdView.MultiLine = true

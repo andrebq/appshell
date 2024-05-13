@@ -1,3 +1,4 @@
 dist
 history.json
 snapshot.json
+.DS_Store

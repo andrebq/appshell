@@ -3,8 +3,10 @@ package shell
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/d5/tengo/v2"
 	"github.com/d5/tengo/v2/parser"
@@ -22,6 +24,15 @@ type (
 		stdout, stderr proxyWriter
 		stdin          proxyReader
 		importsDir     string
+
+		initRepl func()
+
+		repl struct {
+			constants []tengo.Object
+			globals   []tengo.Object
+			symbols   *tengo.SymbolTable
+			fileset   *parser.SourceFileSet
+		}
 	}
 
 	snapshotFormat struct {
@@ -58,6 +69,7 @@ func New() *Shell {
 		stderr:  proxyWriter{w: io.Discard},
 		stdin:   proxyReader{r: emptyBuffer{}},
 	}
+	s.initRepl = sync.OnceFunc(s.prepareREPL)
 	s.fmtMod = safeFmt(&s.stdout)
 	return s
 }
@@ -68,44 +80,135 @@ func (s *Shell) AllowImportFrom(dir string) {
 
 func (s *Shell) Parse(ctx context.Context, code string) (string, error) {
 	code = strings.TrimSpace(code)
-	fileSet := parser.NewFileSet()
-	srcFile := fileSet.AddFile("(main)", -1, len(code))
-	p := parser.NewParser(srcFile, []byte(code), nil)
-	_, err := p.ParseFile()
+	_, _, err := s.parseAST(parser.NewFileSet(), code)
 	return code, err
 }
 
+func (s *Shell) parseAST(fileSet *parser.SourceFileSet, code string) (*parser.SourceFile, *parser.File, error) {
+	srcFile := fileSet.AddFile("(repl)", -1, len(code))
+	p := parser.NewParser(srcFile, []byte(code), nil)
+	parsed, err := p.ParseFile()
+	return srcFile, parsed, err
+}
+
 func (s *Shell) Eval(ctx context.Context, sout, serr io.Writer, code string, sin io.Reader) error {
-	defer func(ctx context.Context) func() {
+	s.initRepl()
+
+	updateShell := func(ctx context.Context) func() {
+		// update shell sets the context and redirects io
+		// to the given writers/readers
+		//
+		// then, returns an function that should be called to
+		// undo, those changes
 		old := s.ctx
 		s.ctx = ctx
-		return func() { s.ctx = old }
-	}(ctx)
 
-	script := tengo.NewScript([]byte(code))
-	for k, v := range s.globals {
-		script.Add(k, v)
+		oldsout := s.stdout.w
+		oldserr := s.stdout.w
+		oldsin := s.stdin.r
+
+		s.stdout.w = sout
+		s.stderr.w = serr
+		s.stdin.r = sin
+
+		return func() {
+			s.ctx = old
+			s.stdout.w = oldsout
+			s.stderr.w = oldserr
+			s.stdin.r = oldsin
+		}
 	}
+	defer updateShell(ctx)()
 
-	s.stdout.w = sout
-	s.stderr.w = serr
-	s.stdin.r = sin
-
-	script.SetImports(s.modules())
-	if s.importsDir != "" {
-		script.EnableFileImport(true)
-		script.SetImportDir(s.importsDir)
-	} else {
-		script.EnableFileImport(false)
-	}
-	output, err := script.RunContext(ctx)
+	srcFile, file, err := s.parseAST(s.repl.fileset, code)
 	if err != nil {
 		return err
 	}
-	for _, v := range output.GetAll() {
-		s.globals[v.Name()] = v.Object()
+
+	file = s.addPrints(file)
+	c := tengo.NewCompiler(srcFile, s.repl.symbols, s.repl.constants, s.modules(), nil)
+	if s.importsDir != "" {
+		c.EnableFileImport(true)
+		c.SetImportDir(s.importsDir)
 	}
+	if err := c.Compile(file); err != nil {
+		return fmt.Errorf("tengo: compilation error %v", err)
+	}
+
+	bytecode := c.Bytecode()
+	machine := tengo.NewVM(bytecode, s.repl.globals, -1)
+	if err := machine.Run(); err != nil {
+		return fmt.Errorf("tengo: eval error: %v", err)
+	}
+	s.repl.constants = bytecode.Constants
 	return nil
+}
+
+func (s *Shell) addPrints(file *parser.File) *parser.File {
+	var stmts []parser.Stmt
+	for _, s := range file.Stmts {
+		switch s := s.(type) {
+		case *parser.ExprStmt:
+			stmts = append(stmts, &parser.ExprStmt{
+				Expr: &parser.CallExpr{
+					Func: &parser.Ident{Name: "__repl_println__"},
+					Args: []parser.Expr{s.Expr},
+				},
+			})
+		case *parser.AssignStmt:
+			stmts = append(stmts, s)
+
+			stmts = append(stmts, &parser.ExprStmt{
+				Expr: &parser.CallExpr{
+					Func: &parser.Ident{
+						Name: "__repl_println__",
+					},
+					Args: s.LHS,
+				},
+			})
+		default:
+			stmts = append(stmts, s)
+		}
+	}
+	return &parser.File{
+		InputFile: file.InputFile,
+		Stmts:     stmts,
+	}
+}
+
+func (s *Shell) prepareREPL() {
+	globals := make([]tengo.Object, tengo.GlobalsSize)
+	symbolTable := tengo.NewSymbolTable()
+	for idx, fn := range tengo.GetAllBuiltinFunctions() {
+		symbolTable.DefineBuiltin(idx, fn.Name)
+	}
+
+	// embed println function
+	symbol := symbolTable.Define("__repl_println__")
+	globals[symbol.Index] = &tengo.UserFunction{
+		Name: "println",
+		Value: func(args ...tengo.Object) (ret tengo.Object, err error) {
+			var printArgs []interface{}
+			for _, arg := range args {
+				if _, isUndefined := arg.(*tengo.Undefined); isUndefined {
+					// avoid printing undefined values
+					continue
+				} else {
+					s, _ := tengo.ToString(arg)
+					printArgs = append(printArgs, s)
+				}
+			}
+			printArgs = append(printArgs, "\n")
+			_, _ = fmt.Fprint(&s.stdout, printArgs...)
+			return
+		},
+	}
+
+	var constants []tengo.Object
+	s.repl.constants = constants
+	s.repl.globals = globals
+	s.repl.symbols = symbolTable
+	s.repl.fileset = parser.NewFileSet()
 }
 
 func (s *Shell) modules() tengo.ModuleGetter {
